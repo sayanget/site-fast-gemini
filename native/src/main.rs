@@ -33,6 +33,7 @@ extern "C" {
     fn write(fd: i32, b: *const c_void, n: usize) -> isize;
     fn lseek(fd: i32, off: i64, wh: i32) -> i64;
     fn mmap(a: *mut c_void, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut c_void;
+    fn madvise(a: *mut c_void, l: usize, advice: i32) -> i32;
     fn _exit(c: i32) -> !;
     fn strlen(p: *const c_char) -> usize;
 }
@@ -3067,11 +3068,18 @@ pub unsafe extern "C" fn main(_argc: i32, _argv: *const *const u8) -> i32 {
     // holds one flush chunk plus the largest single entry (escaping grows a string at most 6x)
     let out_cap = pg(FLUSH + 8 * n + (16 << 20));
     let total = in_sz + arena_sz + out_cap;
-    let base = mmap(core::ptr::null_mut(), total, PROT_RW, MAP_PRIVATE_ANON | MAP_NORESERVE, -1, 0) as *mut u8;
-    if base as isize == -1 {
+    const HUGE: usize = 2 << 20;
+    let raw = mmap(core::ptr::null_mut(), total + HUGE, PROT_RW, MAP_PRIVATE_ANON | MAP_NORESERVE, -1, 0) as *mut u8;
+    if raw as isize == -1 {
         _exit(71);
     }
-    mmap(base as *mut c_void, in_sz + arena_sz + out_pop, PROT_RW, MAP_PRIVATE_ANON | MAP_FIXED | MAP_POPULATE, -1, 0);
+    // 2 MiB-aligned, so the prefaulted part can be backed by transparent huge pages where the kernel offers them
+    let base = ((raw as usize + HUGE - 1) & !(HUGE - 1)) as *mut u8;
+    let pop = in_sz + arena_sz + out_pop;
+    if madvise(base as *mut c_void, pop, 14) != 0 || madvise(base as *mut c_void, pop, 23) != 0 {
+        // no MADV_HUGEPAGE / MADV_POPULATE_WRITE here: prefault in 4 KiB pages
+        mmap(base as *mut c_void, pop, PROT_RW, MAP_PRIVATE_ANON | MAP_FIXED | MAP_POPULATE, -1, 0);
+    }
     CUR = base as usize + in_sz;
     END = CUR + arena_sz;
 
